@@ -3,7 +3,6 @@
 Thumbs.db
 
 node_modules
-dist
 
 # bundled files
 *.umd.js
