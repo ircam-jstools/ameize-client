@@ -148,6 +148,7 @@ const client = {
 
   killProcess(killTokenUuid) {
     const { proc, uuid } = this.forkedProcess;
+    const forkTokenUuid = uuid;
 
     if (proc !== null) {
       const forkTokenUuid = uuid;
@@ -166,6 +167,9 @@ const client = {
       });
     } else {
       console.error('cannot kill inexisting process');
+      //
+      const ack = `KILL_ACK ${killTokenUuid} ${forkTokenUuid}`;
+      this.udpClient.send(ack);
     }
   },
 
