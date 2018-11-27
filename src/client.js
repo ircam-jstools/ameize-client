@@ -8,10 +8,6 @@ import split from 'split';
 
 const MSG_DELIMITER = 'AMEIZE_MSG_DELIMITER_$352NS0lAZL&';
 
-function sanitizeJSON(unsanitized){
-    return unsanitized.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t").replace(/\f/g, "\\f").replace(/"/g,"\\\"").replace(/'/g,"\\\'").replace(/\&/g, "\\&");
-}
-
 // reference to the forked process
 const forkedProcess = {
   uuid: null,
