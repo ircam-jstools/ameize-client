@@ -1,180 +1,251 @@
-import { DiscoveryClient, config } from '@ircam/node-discovery';
 import os from 'os';
+import net from 'net';
+import { exec, execSync, spawn } from 'child_process';
+import { DiscoveryClient, config } from '@ircam/node-discovery';
 import getPort from 'get-port';
-import { exec, spawn } from 'child_process';
-import readline from 'readline';
 import terminate from 'terminate';
-// import captureConsole from 'capture-console';
-var intercept = require("intercept-stdout");
-var captureConsole = require('capture-console');
+import split from 'split';
 
+const MSG_DELIMITER = 'AMEIZE_MSG_DELIMITER_$352NS0lAZL&';
 
+function sanitizeJSON(unsanitized){
+    return unsanitized.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t").replace(/\f/g, "\\f").replace(/"/g,"\\\"").replace(/'/g,"\\\'").replace(/\&/g, "\\&");
+}
+
+// reference to the forked process
+const forkedProcess = {
+  uuid: null,
+  proc: null,
+};
+
+const TCP_PORT = 8091;
+
+// client of the ameize-controller
 const client = {
   initialize({
     debug = false,
   } = {}) {
 
     this.dispatch = this.dispatch.bind(this);
-    this.$HOME = null;
-    this.hostname = os.hostname(); // may be overriden if `debug=true`
+    this.tcpClient = null;
 
-    this.forkedProcess = {
-      uuid: null,
-      proc: null,
-    };
-
-    const homePromise = new Promise((resolve, reject) => {
-      exec('echo $HOME', (err, stdout, stderr) => {
-        if (err)
-          return console.error(err);
-        // remove trailing new line
-        resolve(stdout.toString().replace(/\s$/g, ''));
-      });
-    });
-
-    const discoveryOptions = {
-      verbose: false,
-      port: config.BROADCAST_PORT,
-    };
-
-    let discoveryPromise = null;
-
-    if (debug === false) {
-      discoveryPromise = Promise.resolve(discoveryOptions);
-    } else {
-      discoveryPromise = getPort()
-        .then(port => {
-          // create dummy hostname in debug mode
-          this.hostname = `wat-debug-${parseInt(Math.random() * 100)}`;
-
-          discoveryOptions.verbose = true;
-          discoveryOptions.port = port;
-
-          return discoveryOptions;
-        })
-        .catch(err => console.error(err.stack));
+    try {
+      this.$HOME = execSync('echo $HOME').toString().replace(/\s$/g, '');
+    } catch(err) {
+      console.error(err.stack);
     }
 
-    return Promise.all([homePromise, discoveryPromise])
-      .then(([homePath, discoveryOptions]) => {
-        this.$HOME = homePath;
+    let portPromise;
 
-        discoveryOptions.payload = { hostname: this.hostname };
+    if (!debug) {
+      this.hostname = os.hostname(); // may be overriden if `debug=true`
+      portPromise = Promise.resolve(config.BROADCAST_PORT);
+    } else {
+      this.hostname = `ameize-client-${parseInt(Math.random() * 100000)}`;
+      portPromise = getPort();
+    }
 
-        this.discoveryOptions = discoveryOptions;
-        this.udpClient = new DiscoveryClient(discoveryOptions);
+    return portPromise.then(port => {
+      this.discoveryClient = new DiscoveryClient({ port: port });
 
-        this.udpClient.once('connection', () => {
+      this.discoveryClient.on('connection', (rinfo) => {
+        this.connected = true;
+        this.openTcpClient(rinfo);
+      });
 
-          captureConsole.startIntercept(process.stdout, stdout => {
-            this.udpClient.send(`STDOUT ${stdout.toString()}`);
-          });
+      this.discoveryClient.on('close', () => {
+        this.connected = false;
+      });
 
-          captureConsole.startIntercept(process.stderr, stderr => {
-            this.udpClient.send(`STDERR ${stderr.toString()}`);
-          });
+      this.discoveryClient.start();
 
-          console.log(`${this.hostname} connected`);
-        });
-
-        // receive only message that do not match the discovery protocol
-        this.udpClient.on('message', this.dispatch);
-        this.udpClient.start();
-
-        return Promise.resolve(this);
-      })
-      .catch(err => console.error(err));
+      return Promise.resolve(this);
+    })
+    .catch(err => console.error(err));
   },
 
-  dispatch(buffer, rinfo) {
-    const msg = buffer.toString().replace(/\s\s+/g, ' ').split(' ');
-    const protocol = msg.shift();
-    const tokenUuid = msg.shift()
+  openTcpClient(rinfo) {
+    console.log('openTcpClient', 'open');
+    // if we appear connected, keep trying to open the socket
+    if (this.connected) {
+      this.tcpClient = net.createConnection({ port: TCP_PORT, host: rinfo.address }, () => {
+        const handshakeMsg = {
+          type: 'HANDSHAKE',
+          payload: { hostname: this.hostname },
+        };
 
-    switch (protocol) {
-      case 'EXEC': {
-        const cwd = msg.shift().replace(/^\~/, this.$HOME);
-        const cmd = msg.join(' ');
+        console.log('openTcpClient', 'opened');
+        this.tcpClient.write(JSON.stringify(handshakeMsg) + MSG_DELIMITER);
+        this.tcpClient.pipe(split(MSG_DELIMITER)).on('data', this.dispatch);
+      });
 
-        this.executeCmd(tokenUuid, cwd, cmd);
-        break;
-      }
-      case 'FORK': {
-        const cwd = msg.shift().replace(/^\~/, this.$HOME);
-        const cmd = msg.shift();
-        const args = msg;
+      this.tcpClient.on('end', () => {
+        setTimeout(() => { this.openTcpClient(rinfo) }, 1000);
+      });
 
-        this.forkProcess(tokenUuid, cwd, cmd, args);
-        break;
-      }
-      case 'KILL': {
-        this.killProcess(tokenUuid);
-        break;
+      this.tcpClient.on('error', () => {
+        setTimeout(() => { this.openTcpClient(rinfo) }, 1000);
+      });
+    }
+  },
+
+  pipeStdOut(data) {
+    const msg = {
+      type: 'STDOUT',
+      payload: {
+        msg: data.trim(),
+      },
+    };
+
+    this.tcpClient.write(JSON.stringify(msg) + MSG_DELIMITER);
+  },
+
+  pipeStdErr(data) {
+    const msg = {
+      type: 'STDERR',
+      payload: {
+        msg: data.trim(),
+      },
+    };
+
+    this.tcpClient.write(JSON.stringify(msg) + MSG_DELIMITER);
+  },
+
+  send(data) {
+    if (this.tcpClient) {
+      this.tcpClient.write(JSON.stringify(data) + MSG_DELIMITER);
+    }
+  },
+
+  dispatch(data) {
+    if (data) {
+      const { type, payload } = JSON.parse(data);
+      const tokenUuid = payload.tokenUuid;
+      console.log(type, payload);
+
+      switch (type) {
+        case 'EXEC': {
+          const cwd = payload.cwd.replace(/^\~/, this.$HOME);
+          const cmd = payload.cmd;
+
+          this.executeCmd(tokenUuid, cwd, cmd);
+          break;
+        }
+        case 'FORK': {
+          const cwd = payload.cwd.replace(/^\~/, this.$HOME);
+          const parts = payload.cmd.split(' ');
+          const cmd = parts.shift();
+          const args = parts;
+          console.log(cwd, cmd, args);
+
+          this.forkProcess(tokenUuid, cwd, cmd, args);
+          break;
+        }
+        case 'KILL': {
+          this.killProcess(tokenUuid);
+          break;
+        }
       }
     }
   },
 
   executeCmd(tokenUuid, cwd, cmd) {
-    exec(cmd, { cwd: cwd, }, (err, stdout, stderr) => {
-      if (err)
-        return console.error(err);
+    exec(cmd, { cwd }, (err, stdout, stderr) => {
+      if (err) {
+        return this.pipeStdErr(err.message);
+      }
 
-      console.log(stdout.toString());
-      console.log(stderr.toString());
+      this.pipeStdOut(stdout.toString());
+      this.pipeStdErr(stderr.toString());
 
-      const ack = `EXEC_ACK ${tokenUuid}`;
-      this.udpClient.send(ack);
+      const ack = {
+        type: 'EXEC_ACK',
+        payload: { tokenUuid },
+      };
+
+      this.send(ack);
     });
   },
 
   forkProcess(tokenUuid, cwd, cmd, args) {
-    if (this.forkedProcess.proc === null) {
+    const fork = () => {
       const proc = spawn(cmd, args, { cwd });
 
       // remove end of line as console.log will add a new one
-      proc.stdout.on('data', data => console.log(data.toString().trim()));
-      proc.stderr.on('data', data => console.error(data.toString().trim()));
-      proc.on('close', code => console.log(`child process exited with code ${code}`));
+      proc.stdout.on('data', data => this.pipeStdOut(data.toString()));
+      proc.stderr.on('data', data => this.pipeStdErr(data.toString()));
+      proc.on('close', code => this.pipeStdOut(`exit child process (code ${code})`));
+      proc.on('error', err => this.pipeStdErr(`${err.message}`));
 
-      this.forkedProcess.uuid = tokenUuid;
-      this.forkedProcess.proc = proc;
+      forkedProcess.uuid = tokenUuid;
+      forkedProcess.proc = proc;
 
-      const ack = `FORK_ACK ${tokenUuid}`;
-      this.udpClient.send(ack);
+      const ack = {
+        type: 'FORK_ACK',
+        payload: { forkTokenUuid: tokenUuid },
+      };
+
+      this.send(ack);
+    }
+
+    if (forkedProcess.proc === null) {
+      fork();
     } else {
-      console.error('cannot start process, a process is already running');
+      // if a process was running from a previous controller session, kill it
+      const { proc } = forkedProcess;
+
+      this.pipeStdOut(`kill process (pid: ${proc.pid})`);
+
+      terminate(proc.pid, err => {
+        if (err) {
+          this.pipeStdErr(`...an error occured while killing process (pid: ${proc.pid}): "${err.message}"`);
+        }
+
+        forkedProcess.proc = null;
+        forkedProcess.uuid = null;
+
+        fork();
+      });
     }
   },
 
   killProcess(killTokenUuid) {
-    const { proc, uuid } = this.forkedProcess;
+    const { proc, uuid } = forkedProcess;
     const forkTokenUuid = uuid;
+    const ack = {
+      type: 'KILL_ACK',
+      payload: {
+        killTokenUuid,
+        forkTokenUuid,
+      },
+    };
 
-    if (proc !== null) {
+    if (proc !== null && proc.pid) {
       const forkTokenUuid = uuid;
 
       terminate(proc.pid, err => {
-        if (err)
-          console.error('...an error occured while killing the process', err);
+        if (err) {
+          this.pipeStdErr(`...an error occured while killing process (pid: ${proc.pid}): "${err.message}"`);
+        }
 
-        // if process has crashed and thus cannot be killed,
-        // we still want to reset everything...
-        this.forkedProcess.proc = null;
-        this.forkedProcess.uuid = null;
+        forkedProcess.proc = null;
+        forkedProcess.uuid = null;
 
-        const ack = `KILL_ACK ${killTokenUuid} ${forkTokenUuid}`;
-        this.udpClient.send(ack);
+        this.send(ack);
       });
     } else {
-      console.error('cannot kill inexisting process');
-      //
-      const ack = `KILL_ACK ${killTokenUuid} ${forkTokenUuid}`;
-      this.udpClient.send(ack);
+      this.pipeStdErr('cannot kill inexisting process');
+
+      forkedProcess.proc = null;
+      forkedProcess.uuid = null;
+
+      this.send(ack);
     }
   },
 
   quit() {
-    this.udpClient.stop();
+    this.discoveryClient.stop();
+    this.tcpClient.end();
   },
 }
 

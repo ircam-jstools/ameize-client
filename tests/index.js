@@ -1,9 +1,5 @@
-// import tape from 'tape';
-// import myLibrary from '../src/index';
+const client = require('../dist/client').default;
 
-// tape('myLibrary', (t) => {
-//   t.comment('- #getTrue()');
-//   t.deepEqual(myLibrary.getTrue(), true, 'getTrue should return true');
-
-//   t.end();
-// });
+client
+  .initialize({ debug: true })
+  .catch(err => console.error(err.stack));
