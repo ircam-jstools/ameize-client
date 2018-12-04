@@ -27,6 +27,7 @@ const client = {
 
     try {
       this.$HOME = execSync('echo $HOME').toString().replace(/\s$/g, '');
+      this.$userUid = parseInt(execSync('id -u pi').toString());
     } catch(err) {
       console.error(err.stack);
     }
@@ -132,7 +133,6 @@ const client = {
           const parts = payload.cmd.split(' ');
           const cmd = parts.shift();
           const args = parts;
-          console.log(cwd, cmd, args);
 
           this.forkProcess(tokenUuid, cwd, cmd, args);
           break;
@@ -146,7 +146,7 @@ const client = {
   },
 
   executeCmd(tokenUuid, cwd, cmd) {
-    exec(cmd, { cwd }, (err, stdout, stderr) => {
+    exec(cmd, { cwd, uid: this.$userUid }, (err, stdout, stderr) => {
       if (err) {
         return this.pipeStdErr(err.message);
       }
@@ -165,8 +165,7 @@ const client = {
 
   forkProcess(tokenUuid, cwd, cmd, args) {
     const fork = () => {
-      const proc = spawn(cmd, args, { cwd });
-
+      const proc = spawn(cmd, args, { cwd, uid: this.$userUid });
       // remove end of line as console.log will add a new one
       proc.stdout.on('data', data => this.pipeStdOut(data.toString()));
       proc.stderr.on('data', data => this.pipeStdErr(data.toString()));
